@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <utility>
 
@@ -111,7 +113,7 @@ class RegKeyListenerBase
 public:
     RegKeyListenerBase(HKEY rootKey, const wchar_t* targetKeyPath, BOOL watchSubtree, DWORD notifyFilter)
         : m_RootKey(rootKey), m_TargetKeyPath(targetKeyPath), m_WatchSubtree(watchSubtree), m_NotifyFilter(notifyFilter),
-        m_Inited(false), m_Started(false), m_Continue(true)
+        m_Inited(false), m_Started(false), m_Canceled(false)
     {
         m_Inited = Init();
     }
@@ -130,30 +132,27 @@ public:
     bool Start()
     {
         std::scoped_lock locker{ m_Mutex };
+
         if (!m_Inited)
         {
             return false;
         }
-
         if (m_Started)
         {
-            return false;
+            return true;
         }
+
         if (!RegisterNotify())
         {
             return false;
         }
 
-        raii::Handle thread{ ::CreateThread(NULL, 0, &RegKeyListenerBase::WaitForNofityThreadProc, this, 0, nullptr),
-                            CloseHandle };
-        if (!thread)
-        {
-            return false;
-        }
+        m_Thread = std::make_unique<std::thread>(std::bind(&RegKeyListenerBase::WaitForNofity, this));
 
         m_Started = true;
         return true;
     }
+
     void Stop()
     {
         std::scoped_lock locker{ m_Mutex };
@@ -163,10 +162,19 @@ public:
             return;
         }
 
-        m_Continue = false;
-        ::SetEvent(m_RegNotifyEvent); // trigger event manually to stop wait thread
-        constexpr DWORD TimeOutOneSec = 1000;
-        ::WaitForSingleObject(m_WaitThreadCompleteEvent, TimeOutOneSec); // wait for complete of wait thread
+        NotifyThreadExit();
+
+        if (m_Thread)
+        {
+            if (m_Thread->joinable())
+            {
+                m_Thread->join();
+            }
+            m_Thread.reset();
+        }
+
+        m_Canceled = false;
+        m_Started = false;
     }
 
 protected:
@@ -190,39 +198,20 @@ private:
         }
         m_RegNotifyEvent = std::move(regNotify);
 
-        raii::Handle waitThread{ ::CreateEventW(NULL, FALSE, FALSE, NULL), CloseHandle };
-        if (!waitThread)
-        {
-            return false;
-        }
-        m_WaitThreadCompleteEvent = std::move(waitThread);
-
         return true;
     }
+
     bool RegisterNotify()
     {
         LONG lError = ::RegNotifyChangeKeyValue(m_TargetKey, m_WatchSubtree, m_NotifyFilter, m_RegNotifyEvent, TRUE);
-        if (ERROR_SUCCESS != lError)
-        {
-            return false;
-        }
-        return true;
+
+        return ERROR_SUCCESS == lError;
     }
 
-    static DWORD WINAPI WaitForNofityThreadProc(LPVOID threadParam)
-    {
-        RegKeyListenerBase* pThis = reinterpret_cast<RegKeyListenerBase*>(threadParam);
-        if (nullptr == pThis)
-        {
-            return 1;
-        }
-
-        return pThis->WaitForNofity();
-    }
     DWORD WaitForNofity()
     {
         DWORD dwRet = 0;
-        while (m_Continue)
+        while (!m_Canceled)
         {
             DWORD dwWait = ::WaitForSingleObject(m_RegNotifyEvent, INFINITE);
             if (WAIT_OBJECT_0 != dwWait)
@@ -230,27 +219,32 @@ private:
                 // TODO: Log unexpected error.
             }
 
-            if (m_Continue)
+            if (m_Canceled)
             {
-                // notify key changed
-                {
-                    std::scoped_lock locker{ m_Mutex };
-                    OnKeyChanged();
-                }
-
-                // re-register
-                if (!RegisterNotify())
-                {
-                    dwRet = 2;
-                    break;
-                }
-            }
-            else
                 break;
+            }
+
+            // notify key changed
+            {
+                std::scoped_lock locker{ m_Mutex };
+                OnKeyChanged();
+            }
+
+            // re-register
+            if (!RegisterNotify())
+            {
+                dwRet = 2;
+                break;
+            }
         }
-        ::SetEvent(m_WaitThreadCompleteEvent);
 
         return dwRet;
+    }
+
+    void NotifyThreadExit()
+    {
+        m_Canceled = true;
+        ::SetEvent(m_RegNotifyEvent);
     }
 
 private:
@@ -259,12 +253,13 @@ private:
     const BOOL m_WatchSubtree;
     const DWORD m_NotifyFilter;
 
+    std::mutex m_Mutex;
+    volatile bool m_Canceled;
     bool m_Inited;
     bool m_Started;
-    volatile bool m_Continue;
-    std::mutex m_Mutex;
 
     raii::Handle<HKEY, decltype(&RegCloseKey)> m_TargetKey;
     raii::Handle<HANDLE, decltype(&CloseHandle)> m_RegNotifyEvent;
-    raii::Handle<HANDLE, decltype(&CloseHandle)> m_WaitThreadCompleteEvent;
+
+    std::unique_ptr<std::thread> m_Thread;
 };
